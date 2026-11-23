@@ -12,12 +12,15 @@
     python deepseek_meter.py --balance                # 只查一次余额，看脚本是否正常
     python deepseek_meter.py --report                 # 看汇总
     python deepseek_meter.py --report --since 2026-11-01
+    python deepseek_meter.py --report --sessions      # 按会话汇总
+    python deepseek_meter.py --session S20261123      # 看单个会话的逐条明细
     pythonw deepseek_meter.py --daemon-log meter.log  # 无窗口后台运行（开机自启用）
 """
 
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import http.client
 import json
 import os
@@ -50,7 +53,13 @@ FIELDS = [
     "ts", "model", "endpoint", "stream", "period",
     "prompt_tokens", "cache_hit", "cache_miss", "completion_tokens",
     "total_tokens", "cost_cny", "status",
+    "session_id", "turn", "ctx_tokens", "session_cost", "compacted",
 ]
+
+# 会话切分：同一「首条消息指纹」且请求间隔不超过 30 分钟，算同一个会话。
+SESSION_GAP_SEC = 30 * 60
+# 单个会话累计花费到这个数就弹一次通知。
+SESSION_ALERT_CNY = 5.0
 
 _lock = threading.Lock()
 
@@ -105,9 +114,27 @@ def pick_usage(obj) -> dict | None:
     }
 
 
+def _migrate_log(log_path: str) -> None:
+    """老版本 CSV 只有 12 列，就地补上新列（旧行留空），避免表头错位。"""
+    with open(log_path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    tmp = log_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in FIELDS})
+    os.replace(tmp, log_path)
+
+
 def log_row(log_path: str, row: dict) -> None:
     with _lock:
         new = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+        if not new:
+            with open(log_path, encoding="utf-8-sig", newline="") as f:
+                header = next(csv.reader(f), [])
+            if header != FIELDS:
+                _migrate_log(log_path)
         with open(log_path, "a", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS)
             if new:
@@ -115,8 +142,52 @@ def log_row(log_path: str, row: dict) -> None:
             w.writerow(row)
 
 
+_sessions = {}  # 首条消息指纹 -> 当前会话状态
+
+
+def fingerprint_of(obj) -> str:
+    """取首条 user 消息的哈希，作为「是否同一个会话」的判据；取不到返回空串。"""
+    msgs = obj.get("messages") if isinstance(obj, dict) else None
+    if not isinstance(msgs, list):
+        return ""
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "user":
+            content = m.get("content")
+            if isinstance(content, list):
+                content = json.dumps(content, ensure_ascii=False)
+            if isinstance(content, str) and content.strip():
+                return hashlib.sha1(content.strip().encode("utf-8")).hexdigest()[:8]
+    return ""
+
+
+def update_session(fp: str, now: dt.datetime, ctx_tokens: int, cost: float):
+    """返回 (会话ID, 第几轮, 会话累计金额, 是否压缩, 是否需要提醒)。"""
+    with _lock:
+        st = _sessions.get(fp)
+        if st is None or (now - st["last"]).total_seconds() > SESSION_GAP_SEC:
+            st = {
+                "id": f"S{now:%Y%m%d-%H%M%S}-{fp[:6] or 'anon'}",
+                "turn": 0,
+                "prev": 0,
+                "cost": 0.0,
+                "alerted": False,
+                "last": now,
+            }
+            _sessions[fp] = st
+        st["turn"] += 1
+        # 输入 token 比上一轮缩水超过 10%，基本就是客户端把历史压缩/截断了
+        compacted = 1 if st["prev"] and ctx_tokens < st["prev"] * 0.9 else 0
+        st["prev"] = ctx_tokens
+        st["cost"] = round(st["cost"] + cost, 6)
+        st["last"] = now
+        alert = st["cost"] >= SESSION_ALERT_CNY and not st["alerted"]
+        if alert:
+            st["alerted"] = True
+        return st["id"], st["turn"], st["cost"], compacted, alert
+
+
 def record(log_path: str, model: str, endpoint: str, stream: bool,
-           usage: dict, status: int) -> None:
+           usage: dict, status: int, fp: str = "") -> None:
     now = dt.datetime.now()
     peak = is_peak(now)
     hit = usage["hit"]
@@ -126,6 +197,7 @@ def record(log_path: str, model: str, endpoint: str, stream: bool,
     if miss is None:
         miss = max(usage["prompt"] - hit, 0)
     cost = calc_cost(model, hit, miss, usage["comp"], peak)
+    sid, turn, sess_cost, compacted, alert = update_session(fp, now, usage["prompt"], cost)
     row = {
         "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
         "model": model or "?",
@@ -139,10 +211,18 @@ def record(log_path: str, model: str, endpoint: str, stream: bool,
         "total_tokens": usage["total"],
         "cost_cny": cost,
         "status": status,
+        "session_id": sid,
+        "turn": turn,
+        "ctx_tokens": usage["prompt"],
+        "session_cost": sess_cost,
+        "compacted": compacted,
     }
     log_row(log_path, row)
     print(f"[{row['ts']}] {row['model']}  in={usage['prompt']} (hit {hit}) "
           f"out={usage['comp']}  ¥{cost:.4f}  {row['period']}", flush=True)
+    if alert:
+        notify("会话花费提醒",
+               f"{sid} 已累计 {sess_cost:.2f} 元（{turn} 次请求）")
 
 
 # ---------- 余额监控 ----------
@@ -234,22 +314,23 @@ def watch_balance(key: str, upstream: str, threshold: float, interval_min: float
 # ---------- 请求处理 ----------
 def prepare_body(body: bytes, inject: bool):
     """解析请求体，必要时给流式请求补上 include_usage，保证能拿到 token 数。"""
-    model, stream = "", False
+    model, stream, fp = "", False, ""
     if not body:
-        return body, model, stream
+        return body, model, stream, fp
     try:
         obj = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return body, model, False
+        return body, model, False, fp
     if not isinstance(obj, dict):
-        return body, model, False
+        return body, model, False, fp
 
     model = obj.get("model") or ""
     stream = bool(obj.get("stream"))
+    fp = fingerprint_of(obj)
     if stream and inject and "stream_options" not in obj:
         obj["stream_options"] = {"include_usage": True}
-        return json.dumps(obj, ensure_ascii=False).encode("utf-8"), model, stream
-    return body, model, stream
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8"), model, stream, fp
+    return body, model, stream, fp
 
 
 class MeterHandler(BaseHTTPRequestHandler):
@@ -291,7 +372,7 @@ class MeterHandler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        body, model_hint, is_stream_req = prepare_body(body, self.inject_usage)
+        body, model_hint, is_stream_req, fp = prepare_body(body, self.inject_usage)
 
         headers = {}
         for k, v in self.headers.items():
@@ -382,7 +463,7 @@ class MeterHandler(BaseHTTPRequestHandler):
         model = resp_model or model_hint or "?"
         if usage and resp.status < 400:
             record(self.log_path, model, self.command + " " + self.path,
-                   is_stream_req or is_sse, usage, resp.status)
+                   is_stream_req or is_sse, usage, resp.status, fp)
         elif resp.status >= 400:
             print(f"[!] {resp.status} {self.path}，未记账", flush=True)
         elif is_stream_req:
@@ -434,6 +515,82 @@ def report(log_path: str, since: str | None) -> int:
     return 0
 
 
+def report_sessions(log_path: str, since: str | None) -> int:
+    """按会话汇总：每个会话一共花了多少、聊了多少轮、缓存命中率、压缩过几次。"""
+    if not os.path.exists(log_path):
+        print(f"还没有记录文件：{log_path}")
+        return 1
+    agg = {}
+    with open(log_path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if since and row["ts"][:10] < since:
+                continue
+            sid = row.get("session_id") or "(旧记录)"
+            a = agg.setdefault(sid, {"start": row["ts"], "end": row["ts"], "n": 0,
+                                     "in": 0, "hit": 0, "out": 0, "cost": 0.0, "comp": 0})
+            a["start"] = min(a["start"], row["ts"])
+            a["end"] = max(a["end"], row["ts"])
+            a["n"] += 1
+            a["in"] += int(row["prompt_tokens"] or 0)
+            a["hit"] += int(row.get("cache_hit") or 0)
+            a["out"] += int(row.get("completion_tokens") or 0)
+            a["cost"] += float(row.get("cost_cny") or 0)
+            a["comp"] += int(row.get("compacted") or 0)
+    if not agg:
+        print("该范围内没有记录")
+        return 0
+
+    print(f"{'会话ID':<26}{'开始':<20}{'时长':>6}{'次数':>5}{'输入tok':>12}"
+          f"{'命中率':>8}{'输出tok':>10}{'金额(元)':>11}{'压缩':>5}")
+    print("-" * 103)
+    grand = 0.0
+    for sid, a in sorted(agg.items(), key=lambda kv: kv[1]["start"]):
+        fmt = "%Y-%m-%d %H:%M:%S"
+        mins = (dt.datetime.strptime(a["end"], fmt)
+                - dt.datetime.strptime(a["start"], fmt)).total_seconds() / 60
+        rate = a["hit"] / a["in"] * 100 if a["in"] else 0
+        print(f"{sid:<26}{a['start']:<20}{mins:>5.0f}分{a['n']:>5}{a['in']:>12,}"
+              f"{rate:>7.0f}%{a['out']:>10,}{a['cost']:>11.4f}{a['comp']:>5}")
+        grand += a["cost"]
+    print("-" * 103)
+    print(f"{'合计 ' + str(len(agg)) + ' 个会话':<68}{grand:>11.4f}")
+    return 0
+
+
+def session_detail(log_path: str, sid_prefix: str) -> int:
+    """打印某个会话的逐条明细，会话ID支持只写前缀。"""
+    if not os.path.exists(log_path):
+        print(f"还没有记录文件：{log_path}")
+        return 1
+    rows = []
+    with open(log_path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            sid = row.get("session_id") or ""
+            if sid and sid.startswith(sid_prefix):
+                rows.append(row)
+    if not rows:
+        print(f"没找到会话：{sid_prefix}（可以用 --report --sessions 看有哪些）")
+        return 1
+
+    sid = rows[0]["session_id"]
+    print(f"会话 {sid}（{len(rows)} 次请求）")
+    print(f"{'时间':<20}{'轮':>3} {'模型':<20}{'上下文tok':>11}{'命中tok':>10}"
+          f"{'输出tok':>9}{'本轮(元)':>10}{'累计(元)':>10}{'压缩':>5}")
+    print("-" * 99)
+    for row in rows:
+        print(f"{row['ts']:<20}{int(row.get('turn') or 0):>3} {row['model']:<20}"
+              f"{int(row['prompt_tokens'] or 0):>11,}{int(row.get('cache_hit') or 0):>10,}"
+              f"{int(row.get('completion_tokens') or 0):>9,}"
+              f"{float(row.get('cost_cny') or 0):>10.4f}"
+              f"{float(row.get('session_cost') or 0):>10.4f}"
+              f"{'是' if int(row.get('compacted') or 0) else '':>5}")
+    print("-" * 99)
+    ctx = max(int(r["prompt_tokens"] or 0) for r in rows)
+    print(f"会话累计 {float(rows[-1].get('session_cost') or 0):.4f} 元，"
+          f"最大上下文 {ctx:,} tok")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="DeepSeek 本地计量代理")
     ap.add_argument("--host", default="127.0.0.1", help="监听地址")
@@ -443,6 +600,8 @@ def main() -> int:
     ap.add_argument("--no-inject-usage", action="store_true",
                     help="不自动给流式请求补 include_usage")
     ap.add_argument("--report", action="store_true", help="打印汇总后退出")
+    ap.add_argument("--sessions", action="store_true", help="配合 --report，按会话汇总")
+    ap.add_argument("--session", help="查看单个会话的逐条明细（可只写前缀）")
     ap.add_argument("--since", help="汇总起始日期，如 2026-11-01")
     ap.add_argument("--key", help="DeepSeek API Key（默认读环境变量/key.txt/项目 .env）")
     ap.add_argument("--balance", action="store_true", help="只查一次余额然后退出")
@@ -459,7 +618,12 @@ def main() -> int:
         sys.stdout = sys.stderr = log_file
         print(f"\n===== {dt.datetime.now():%Y-%m-%d %H:%M:%S} 启动 =====", flush=True)
 
+    if args.session:
+        return session_detail(args.log, args.session)
+
     if args.report:
+        if args.sessions:
+            return report_sessions(args.log, args.since)
         return report(args.log, args.since)
 
     key = load_api_key(args.key)
