@@ -1,0 +1,5 @@
+__pycache__/
+*.log
+usage_log.csv
+key.txt
+.env
