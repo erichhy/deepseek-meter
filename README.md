@@ -12,6 +12,7 @@ DeepSeek 官网只提供按月、按 Key 的汇总用量，看不到逐条调用
 - 余额监控：定期查 `/user/balance`，低于阈值弹 Windows 通知
 - 汇总报告：按天 × 模型统计次数、token 与金额
 - 会话统计：把同一段对话的多次请求归到一个会话，看单会话累计花费、轮数、缓存命中率和上下文压缩点
+- 任务视角：会话用首条消息前 30 字命名，`--status` 直接看当前任务花了多少，超阈值提示换任务
 - 看门狗：代理挂掉自动重启，自带 `/__meter/health` 健康检查
 - 纯标准库实现，零第三方依赖
 
@@ -50,6 +51,7 @@ python deepseek_meter.py --report             # 按天/模型汇总
 python deepseek_meter.py --report --since 2026-11-01
 python deepseek_meter.py --report --sessions  # 按会话汇总
 python deepseek_meter.py --session S20261123  # 看单个会话的逐条明细（可只写前缀）
+python deepseek_meter.py --status             # 当前任务累计消耗（判断何时换任务）
 python deepseek_meter.py --balance            # 只查一次余额
 ```
 
@@ -70,17 +72,21 @@ Windows 下也可直接双击 `start_meter.bat` 启动。
 | `--report` / `--since` | 打印汇总后退出，可用 `--since` 限定起始日期 |
 | `--sessions` | 配合 `--report`，按会话汇总 |
 | `--session` | 查看单个会话的逐条明细，会话 ID 可只写前缀 |
+| `--status` | 看当前（默认 30 分钟内活跃）任务的轮数、token、累计金额 |
+| `--active` | `--status` 判定「当前任务」的活跃窗口（分钟，默认 30） |
+| `--session-alert` | 单会话累计多少元提醒，默认 5 |
 
 API Key 查找顺序：`--key` 参数 → 环境变量 `DEEPSEEK_API_KEY` → 同目录 `key.txt` → 上级目录 `.env`。没有 key 时只关闭余额监控，代理本身照常工作。
 
 ## 会话怎么切分
 
 - 同一「首条用户消息」的哈希值，且两次请求间隔不超过 **30 分钟**，算同一个会话；换话题或半小时没动静就开新会话
+- 任务名取首条用户消息的前 30 个字，写进 CSV 的 `task` 列，报告里能直接看出是哪个任务在烧钱
 - 会话 ID 形如 `S20261123-211045-a1b2c3`（开始时间 + 指纹前缀），只存在内存里，代理重启后会重新切分
 - 某次请求的输入 token 比上一轮缩水 10% 以上，标记 `compacted=1`——基本就是客户端压缩或截断了历史
 - 单个会话累计花费到 **5 元**弹一次通知（每个会话只弹一次）
 
-CSV 在原有 12 列后面追加了 `session_id`、`turn`（会话内第几轮）、`ctx_tokens`（本次上下文大小）、`session_cost`（会话累计金额）、`compacted`。旧版 CSV 会在下次写入时原地补列，老记录留空。
+CSV 在原有 12 列后面追加了 `session_id`、`turn`（会话内第几轮）、`ctx_tokens`（本次上下文大小）、`session_cost`（会话累计金额）、`compacted`、`task`（任务名）。旧版 CSV 会在下次写入时原地补列，老记录留空。
 
 ## 后台常驻（Windows）
 

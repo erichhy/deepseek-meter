@@ -14,6 +14,7 @@
     python deepseek_meter.py --report --since 2026-11-01
     python deepseek_meter.py --report --sessions      # 按会话汇总
     python deepseek_meter.py --session S20261123      # 看单个会话的逐条明细
+    python deepseek_meter.py --status                 # 当前任务累计消耗
     pythonw deepseek_meter.py --daemon-log meter.log  # 无窗口后台运行（开机自启用）
 """
 
@@ -53,7 +54,7 @@ FIELDS = [
     "ts", "model", "endpoint", "stream", "period",
     "prompt_tokens", "cache_hit", "cache_miss", "completion_tokens",
     "total_tokens", "cost_cny", "status",
-    "session_id", "turn", "ctx_tokens", "session_cost", "compacted",
+    "session_id", "turn", "ctx_tokens", "session_cost", "compacted", "task",
 ]
 
 # 会话切分：同一「首条消息指纹」且请求间隔不超过 30 分钟，算同一个会话。
@@ -160,8 +161,8 @@ def fingerprint_of(obj) -> str:
     return ""
 
 
-def update_session(fp: str, now: dt.datetime, ctx_tokens: int, cost: float):
-    """返回 (会话ID, 第几轮, 会话累计金额, 是否压缩, 是否需要提醒)。"""
+def update_session(fp: str, now: dt.datetime, ctx_tokens: int, cost: float, label: str = ""):
+    """返回 (会话ID, 第几轮, 会话累计金额, 是否压缩, 是否需要提醒, 任务名)。"""
     with _lock:
         st = _sessions.get(fp)
         if st is None or (now - st["last"]).total_seconds() > SESSION_GAP_SEC:
@@ -172,6 +173,7 @@ def update_session(fp: str, now: dt.datetime, ctx_tokens: int, cost: float):
                 "cost": 0.0,
                 "alerted": False,
                 "last": now,
+                "label": label,
             }
             _sessions[fp] = st
         st["turn"] += 1
@@ -183,11 +185,27 @@ def update_session(fp: str, now: dt.datetime, ctx_tokens: int, cost: float):
         alert = st["cost"] >= SESSION_ALERT_CNY and not st["alerted"]
         if alert:
             st["alerted"] = True
-        return st["id"], st["turn"], st["cost"], compacted, alert
+        return st["id"], st["turn"], st["cost"], compacted, alert, st["label"]
+
+
+def label_of(obj) -> str:
+    """取首条 user 消息的前 30 个字，作为会话（任务）名，方便报告里认。"""
+    msgs = obj.get("messages") if isinstance(obj, dict) else None
+    if not isinstance(msgs, list):
+        return ""
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "user":
+            content = m.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(x.get("text", "")) if isinstance(x, dict) else str(x) for x in content)
+            if isinstance(content, str) and content.strip():
+                return " ".join(content.split())[:30]
+    return ""
 
 
 def record(log_path: str, model: str, endpoint: str, stream: bool,
-           usage: dict, status: int, fp: str = "") -> None:
+           usage: dict, status: int, fp: str = "", label: str = "") -> None:
     now = dt.datetime.now()
     peak = is_peak(now)
     hit = usage["hit"]
@@ -197,7 +215,8 @@ def record(log_path: str, model: str, endpoint: str, stream: bool,
     if miss is None:
         miss = max(usage["prompt"] - hit, 0)
     cost = calc_cost(model, hit, miss, usage["comp"], peak)
-    sid, turn, sess_cost, compacted, alert = update_session(fp, now, usage["prompt"], cost)
+    sid, turn, sess_cost, compacted, alert, task = update_session(
+        fp, now, usage["prompt"], cost, label)
     row = {
         "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
         "model": model or "?",
@@ -216,6 +235,7 @@ def record(log_path: str, model: str, endpoint: str, stream: bool,
         "ctx_tokens": usage["prompt"],
         "session_cost": sess_cost,
         "compacted": compacted,
+        "task": task,
     }
     log_row(log_path, row)
     print(f"[{row['ts']}] {row['model']}  in={usage['prompt']} (hit {hit}) "
@@ -314,23 +334,24 @@ def watch_balance(key: str, upstream: str, threshold: float, interval_min: float
 # ---------- 请求处理 ----------
 def prepare_body(body: bytes, inject: bool):
     """解析请求体，必要时给流式请求补上 include_usage，保证能拿到 token 数。"""
-    model, stream, fp = "", False, ""
+    model, stream, fp, label = "", False, "", ""
     if not body:
-        return body, model, stream, fp
+        return body, model, stream, fp, label
     try:
         obj = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return body, model, False, fp
+        return body, model, False, fp, label
     if not isinstance(obj, dict):
-        return body, model, False, fp
+        return body, model, False, fp, label
 
     model = obj.get("model") or ""
     stream = bool(obj.get("stream"))
     fp = fingerprint_of(obj)
+    label = label_of(obj)
     if stream and inject and "stream_options" not in obj:
         obj["stream_options"] = {"include_usage": True}
-        return json.dumps(obj, ensure_ascii=False).encode("utf-8"), model, stream, fp
-    return body, model, stream, fp
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8"), model, stream, fp, label
+    return body, model, stream, fp, label
 
 
 class MeterHandler(BaseHTTPRequestHandler):
@@ -372,7 +393,7 @@ class MeterHandler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        body, model_hint, is_stream_req, fp = prepare_body(body, self.inject_usage)
+        body, model_hint, is_stream_req, fp, label = prepare_body(body, self.inject_usage)
 
         headers = {}
         for k, v in self.headers.items():
@@ -463,7 +484,7 @@ class MeterHandler(BaseHTTPRequestHandler):
         model = resp_model or model_hint or "?"
         if usage and resp.status < 400:
             record(self.log_path, model, self.command + " " + self.path,
-                   is_stream_req or is_sse, usage, resp.status, fp)
+                   is_stream_req or is_sse, usage, resp.status, fp, label)
         elif resp.status >= 400:
             print(f"[!] {resp.status} {self.path}，未记账", flush=True)
         elif is_stream_req:
@@ -526,8 +547,10 @@ def report_sessions(log_path: str, since: str | None) -> int:
             if since and row["ts"][:10] < since:
                 continue
             sid = row.get("session_id") or "(旧记录)"
-            a = agg.setdefault(sid, {"start": row["ts"], "end": row["ts"], "n": 0,
+            a = agg.setdefault(sid, {"start": row["ts"], "end": row["ts"], "n": 0, "task": "",
                                      "in": 0, "hit": 0, "out": 0, "cost": 0.0, "comp": 0})
+            if not a["task"] and row.get("task"):
+                a["task"] = row["task"]
             a["start"] = min(a["start"], row["ts"])
             a["end"] = max(a["end"], row["ts"])
             a["n"] += 1
@@ -540,20 +563,72 @@ def report_sessions(log_path: str, since: str | None) -> int:
         print("该范围内没有记录")
         return 0
 
-    print(f"{'会话ID':<26}{'开始':<20}{'时长':>6}{'次数':>5}{'输入tok':>12}"
+    print(f"{'会话ID':<26}{'任务':<20}{'开始':<20}{'时长':>6}{'次数':>5}{'输入tok':>12}"
           f"{'命中率':>8}{'输出tok':>10}{'金额(元)':>11}{'压缩':>5}")
-    print("-" * 103)
+    print("-" * 123)
     grand = 0.0
     for sid, a in sorted(agg.items(), key=lambda kv: kv[1]["start"]):
         fmt = "%Y-%m-%d %H:%M:%S"
         mins = (dt.datetime.strptime(a["end"], fmt)
                 - dt.datetime.strptime(a["start"], fmt)).total_seconds() / 60
         rate = a["hit"] / a["in"] * 100 if a["in"] else 0
-        print(f"{sid:<26}{a['start']:<20}{mins:>5.0f}分{a['n']:>5}{a['in']:>12,}"
+        task = (a["task"] or "")[:18]
+        print(f"{sid:<26}{task:<20}{a['start']:<20}{mins:>5.0f}分{a['n']:>5}{a['in']:>12,}"
               f"{rate:>7.0f}%{a['out']:>10,}{a['cost']:>11.4f}{a['comp']:>5}")
         grand += a["cost"]
-    print("-" * 103)
-    print(f"{'合计 ' + str(len(agg)) + ' 个会话':<68}{grand:>11.4f}")
+    print("-" * 123)
+    print(f"{'合计 ' + str(len(agg)) + ' 个会话':<88}{grand:>11.4f}")
+    return 0
+
+
+def status(log_path: str, active_min: float = 30.0) -> int:
+    """看最近一个/几个任务的累计消耗，用来判断该不该换任务。"""
+    if not os.path.exists(log_path):
+        print("还没有记录文件：没有请求走过代理")
+        return 1
+    agg = {}
+    with open(log_path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            sid = row.get("session_id") or ""
+            if not sid:
+                continue
+            a = agg.setdefault(sid, {"last": row["ts"], "task": "", "turn": 0,
+                                     "in": 0, "out": 0, "cost": 0.0})
+            a["last"] = row["ts"]
+            if not a["task"] and row.get("task"):
+                a["task"] = row["task"]
+            a["turn"] = int(row.get("turn") or a["turn"])
+            a["in"] += int(row["prompt_tokens"] or 0)
+            a["out"] += int(row.get("completion_tokens") or 0)
+            a["cost"] += float(row.get("cost_cny") or 0)
+    if not agg:
+        print("还没有会话记录")
+        return 0
+
+    now = dt.datetime.now()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    alive = []
+    for sid, a in agg.items():
+        gap = (now - dt.datetime.strptime(a["last"], fmt)).total_seconds() / 60
+        a["gap"] = gap
+        if gap <= active_min:
+            alive.append((sid, a))
+    shown = alive or [max(agg.items(), key=lambda kv: kv[1]["last"])]
+
+    print(f"{'任务':<22}{'会话ID':<26}{'轮数':>5}{'输入tok':>12}{'输出tok':>10}"
+          f"{'累计(元)':>10}{'最后活跃':>12}")
+    print("-" * 100)
+    for sid, a in sorted(shown, key=lambda kv: kv[1]["last"]):
+        task = (a["task"] or "(无任务名)")[:20]
+        print(f"{task:<22}{sid:<26}{a['turn']:>5}{a['in']:>12,}{a['out']:>10,}"
+              f"{a['cost']:>10.4f}{a['gap']:>10.0f}分")
+    print("-" * 100)
+    if not alive:
+        print(f"最近 {active_min:.0f} 分钟内没有活动会话，上面是最后一个")
+    for sid, a in shown:
+        if a["cost"] >= SESSION_ALERT_CNY:
+            print(f"⚠ {a['task'] or sid} 已花 {a['cost']:.2f} 元，"
+                  f"超过 {SESSION_ALERT_CNY:.0f} 元，可以考虑换任务")
     return 0
 
 
@@ -570,6 +645,13 @@ def session_detail(log_path: str, sid_prefix: str) -> int:
                 rows.append(row)
     if not rows:
         print(f"没找到会话：{sid_prefix}（可以用 --report --sessions 看有哪些）")
+        return 1
+
+    sids = sorted({r["session_id"] for r in rows})
+    if len(sids) > 1:
+        print(f"前缀 {sid_prefix} 匹配到 {len(sids)} 个会话，请多写几位：")
+        for s in sids[:10]:
+            print("  " + s)
         return 1
 
     sid = rows[0]["session_id"]
@@ -592,6 +674,7 @@ def session_detail(log_path: str, sid_prefix: str) -> int:
 
 
 def main() -> int:
+    global SESSION_ALERT_CNY
     ap = argparse.ArgumentParser(description="DeepSeek 本地计量代理")
     ap.add_argument("--host", default="127.0.0.1", help="监听地址")
     ap.add_argument("--port", type=int, default=18788, help="监听端口（默认 18788）")
@@ -602,6 +685,11 @@ def main() -> int:
     ap.add_argument("--report", action="store_true", help="打印汇总后退出")
     ap.add_argument("--sessions", action="store_true", help="配合 --report，按会话汇总")
     ap.add_argument("--session", help="查看单个会话的逐条明细（可只写前缀）")
+    ap.add_argument("--status", action="store_true", help="看当前任务的累计消耗（判断何时换任务）")
+    ap.add_argument("--active", type=float, default=30.0,
+                    help="--status 里多久没活动就不算当前任务（分钟，默认 30）")
+    ap.add_argument("--session-alert", type=float, default=5.0,
+                    help="单会话累计多少元提醒，默认 5")
     ap.add_argument("--since", help="汇总起始日期，如 2026-11-01")
     ap.add_argument("--key", help="DeepSeek API Key（默认读环境变量/key.txt/项目 .env）")
     ap.add_argument("--balance", action="store_true", help="只查一次余额然后退出")
@@ -620,6 +708,11 @@ def main() -> int:
 
     if args.session:
         return session_detail(args.log, args.session)
+
+    SESSION_ALERT_CNY = args.session_alert
+
+    if args.status:
+        return status(args.log, args.active)
 
     if args.report:
         if args.sessions:
