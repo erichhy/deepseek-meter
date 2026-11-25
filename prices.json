@@ -1,0 +1,54 @@
+{
+  "_说明": "单价单位：元 / 百万 tokens；currency=usd 的条目会按 usd_cny 折算。值是对象=价格，是字符串=别名。idle_factor 是非高峰时段系数，不写等于 1。价格为 2026-11 快照，实际以各家官网为准，改这里即可。",
+  "usd_cny": 7.2,
+  "default": {"hit": 0, "miss": 0, "out": 0},
+  "models": {
+    "deepseek-chat": "deepseek-flash",
+    "deepseek-reasoner": "deepseek-v4-pro",
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+    "deepseek-flash": {"hit": 0.04, "miss": 2.0, "out": 8.0, "idle_factor": 0.5},
+    "deepseek-v4-pro": {"hit": 0.30, "miss": 9.0, "out": 27.0, "idle_factor": 0.5},
+
+    "kimi-k2-0711-preview": "kimi-k2",
+    "kimi-latest": "kimi-k2",
+    "kimi-k2": {"hit": 1.0, "miss": 4.0, "out": 16.0},
+    "kimi-k2-turbo": {"hit": 1.0, "miss": 4.0, "out": 16.0},
+    "moonshot-v1-8k": {"hit": 12.0, "miss": 12.0, "out": 12.0},
+    "moonshot-v1-32k": {"hit": 24.0, "miss": 24.0, "out": 24.0},
+    "moonshot-v1-128k": {"hit": 60.0, "miss": 60.0, "out": 60.0},
+
+    "qwen-max": {"hit": 0.48, "miss": 2.4, "out": 9.6},
+    "qwen-plus": {"hit": 0.16, "miss": 0.8, "out": 2.0},
+    "qwen-turbo": {"hit": 0.06, "miss": 0.3, "out": 0.6},
+    "qwen-long": {"hit": 0.1, "miss": 0.5, "out": 2.0},
+
+    "glm-4.6": {"hit": 0.8, "miss": 4.0, "out": 16.0},
+    "glm-4.5": {"hit": 0.8, "miss": 4.0, "out": 16.0},
+    "glm-4-flash": {"hit": 0, "miss": 0, "out": 0},
+
+    "doubao-1.5-pro-32k": {"hit": 0.16, "miss": 0.8, "out": 2.0},
+    "doubao-1.5-pro-256k": {"hit": 1.0, "miss": 5.0, "out": 9.0},
+    "doubao-pro-32k": {"hit": 0.16, "miss": 0.8, "out": 2.0},
+    "doubao-lite-32k": {"hit": 0.06, "miss": 0.3, "out": 0.6},
+
+    "qwen/qwen3-235b-a22b": {"hit": 0.5, "miss": 2.5, "out": 10.0},
+    "deepseek-ai/deepseek-v3": {"hit": 0.2, "miss": 2.0, "out": 8.0},
+
+    "gpt-4o": {"hit": 1.25, "miss": 2.5, "out": 10.0, "currency": "usd"},
+    "gpt-4o-mini": {"hit": 0.075, "miss": 0.15, "out": 0.6, "currency": "usd"},
+    "gpt-4.1": {"hit": 0.5, "miss": 2.0, "out": 8.0, "currency": "usd"},
+    "gpt-4.1-mini": {"hit": 0.1, "miss": 0.4, "out": 1.6, "currency": "usd"},
+    "o3": {"hit": 0.5, "miss": 2.0, "out": 8.0, "currency": "usd"},
+    "o4-mini": {"hit": 0.275, "miss": 1.1, "out": 4.4, "currency": "usd"},
+
+    "claude-sonnet-4": {"hit": 0.3, "miss": 3.0, "out": 15.0, "currency": "usd"},
+    "claude-opus-4": {"hit": 1.5, "miss": 15.0, "out": 75.0, "currency": "usd"},
+    "claude-3-5-haiku": {"hit": 0.08, "miss": 0.8, "out": 4.0, "currency": "usd"},
+
+    "gemini-2.5-pro": {"hit": 0.3125, "miss": 1.25, "out": 10.0, "currency": "usd"},
+    "gemini-2.5-flash-lite": {"hit": 0.025, "miss": 0.1, "out": 0.4, "currency": "usd"},
+    "gemini-2.5-flash": {"hit": 0.075, "miss": 0.3, "out": 2.5, "currency": "usd"},
+    "gemini-2.0-flash": {"hit": 0.025, "miss": 0.1, "out": 0.4, "currency": "usd"}
+  }
+}

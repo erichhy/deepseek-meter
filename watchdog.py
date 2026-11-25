@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""DeepSeek 计量代理看门狗。
+"""用量计量代理看门狗。
 
 每 N 分钟探一次本地端口，进程掉了就重新拉起。
 开机自启的快捷方式指向本脚本，由它负责把 deepseek_meter.py 拉起来。
+换平台时用 --port/--upstream/--log/--prices 再开一个实例即可。
 
 用法:
     pythonw watchdog.py                 # 后台守护（自启用这个）
@@ -49,8 +50,8 @@ def pythonw() -> str:
     return exe
 
 
-def start_meter(port: int) -> None:
-    args = [pythonw(), METER, "--daemon-log", METER_LOG]
+def start_meter(port: int, extra: list[str]) -> None:
+    args = [pythonw(), METER, "--daemon-log", METER_LOG] + extra
     if port != 18788:
         args += ["--port", str(port)]
     subprocess.Popen(args, cwd=BASE_DIR,
@@ -59,12 +60,24 @@ def start_meter(port: int) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="DeepSeek 计量代理看门狗")
+    ap = argparse.ArgumentParser(description="本地用量计量代理看门狗")
     ap.add_argument("--port", type=int, default=18788)
     ap.add_argument("--interval", type=float, default=2.0,
                     help="巡检间隔，单位分钟（默认 2）")
+    # 以下参数原样传给 deepseek_meter.py，方便给别的平台再开一个实例
+    ap.add_argument("--upstream", help="上游地址，如 https://api.moonshot.cn/v1")
+    ap.add_argument("--log", help="记账 CSV 路径")
+    ap.add_argument("--prices", help="价格表 JSON 路径")
+    ap.add_argument("--session-alert", type=float, help="单任务每多花多少元提醒一次")
     args = ap.parse_args()
     interval = max(args.interval, 0.05)
+
+    extra = []
+    for flag, value in (("--upstream", args.upstream), ("--log", args.log),
+                        ("--prices", args.prices),
+                        ("--session-alert", args.session_alert)):
+        if value is not None:
+            extra += [flag, str(value)]
 
     log(f"看门狗启动：端口 {args.port}，每 {interval:g} 分钟巡检")
     while True:
@@ -74,7 +87,7 @@ def main() -> int:
                 log("出现短暂无响应，已自行恢复")
             else:
                 log(f"端口 {args.port} 无响应，重新拉起")
-                start_meter(args.port)
+                start_meter(args.port, extra)
                 time.sleep(15)
                 log("拉起结果：" + ("正常" if alive(args.port) else "仍无响应，下一轮再试"))
         time.sleep(interval * 60)
