@@ -19,6 +19,9 @@ usage_log.csv，并按价格表算出这一次花了多少钱；单个任务的�
     python deepseek_meter.py --session S20261123      # 看单个会话的逐条明细
     python deepseek_meter.py --status                 # 当前任务累计消耗
     pythonw deepseek_meter.py --daemon-log meter.log  # 无窗口后台运行（开机自启用）
+
+任务名：默认取首条 user 消息前 30 字；客户端可用请求头
+X-Meter-Task（百分号编码的 UTF-8，见 _tools/llm_base.task_headers）指定更可读的名字。
 """
 
 import argparse
@@ -34,7 +37,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOG = os.path.join(BASE_DIR, "usage_log.csv")
@@ -294,6 +297,9 @@ def update_session(fp: str, now: dt.datetime, ctx_tokens: int, cost: float, labe
                 "label": label,
             }
             _sessions[fp] = st
+        # 客户端显式给了 X-Meter-Task 就用它，并允许中途改名
+        if label:
+            st["label"] = label
         st["turn"] += 1
         # 输入 token 比上一轮缩水超过 10%，基本就是客户端把历史压缩/截断了
         compacted = 1 if st["prev"] and ctx_tokens < st["prev"] * 0.9 else 0
@@ -626,11 +632,16 @@ class MeterHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         body, model_hint, is_stream_req, fp, label = prepare_body(body, self.inject_usage)
+        # 客户端可以用 X-Meter-Task 指定任务名（百分号编码的 UTF-8），
+        # 比自动截取首条消息更可读；不传就仍按首条消息命名。
+        task_hint = self.headers.get("X-Meter-Task") or ""
+        if task_hint:
+            label = " ".join(unquote(task_hint).split())[:60]
 
         headers = {}
         for k, v in self.headers.items():
             if k.lower() in ("host", "content-length", "accept-encoding",
-                             "connection", "transfer-encoding"):
+                             "connection", "transfer-encoding", "x-meter-task"):
                 continue
             headers[k] = v
         headers["Accept-Encoding"] = "identity"
